@@ -1,41 +1,3 @@
-{-
-import Pruviloj
-import Pruviloj.Induction
-
-%language ElabReflection
-
-isZero : Nat -> Bool
-isZero = %runElab (do n <- gensym "n"
-                      intro n
-                      induction (Var n)
-                      compute
-                      fill `(True)
-                      solve
-                      compute
-                      attack
-                      intros
-                      fill `(False)
-                      solve
-                      solve)
-fib : Nat -> Nat
-fib n = index n (fibs 0 1)
-  where
-    fibs : Nat -> Nat -> Stream Nat
-    fibs a b = a :: fibs b (a + b)
-
-data Result : Nat -> Type where
-  Noop : Result n
-
-getVal : Result n -> Nat
-getVal _ {n} = n
-
-test : Result (Main.fib 10)
-test = Noop
-
-main : IO ()
-main = printLn $ getVal test
-
--}
 import Iaia
 import Iaia.Control
 import Iaia.Data
@@ -65,7 +27,7 @@ prims n _ = sieve [2..n]
     -- Wether n devides m
     notDiv : Nat -> Nat -> Bool
     notDiv Z m = assert_unreachable
-    notDiv n@(S _) m = isZero $ modNatNZ m n SIsNotZ
+    notDiv n@(S _) m = isSucc $ modNatNZ m n SIsNotZ
 
     sieve : List Nat -> CoList Nat
     sieve = ana coalg where
@@ -76,8 +38,7 @@ implementation Functor (XNor a) where
   map f Neither = Neither
   map f (Both x y) = Both x (f y)
 
--- pow itself is total, but due to the partial `hylo`, this implementation has to be
--- partial
+-- Note that `hylo` is partial, so all implementations using it are partial
 partial
 pow : Nat -> Nat -> Nat
 pow x = hylo alg coalg
@@ -132,8 +93,7 @@ fac : Nat -> Nat
 fac n = hylo treeProd coalg (1, n)
   where
     coalg : Coalgebra (LeafTreeF Nat) (Nat, Nat)
-    -- m is the minimal nat in the subtree, and n is the number of nats in the
-    -- subtree
+    -- m is the minimal nat in the subtree, and n is the number of nats in the subtree
     coalg (m, Z) = LeafF m
     coalg (m, S Z) = LeafF m
     coalg (m, n) = let n' = divNatNZ n 2 SIsNotZ in
@@ -168,6 +128,93 @@ mergeSort = hylo alg coalg
     coalg [x] = LeafF [x]
     coalg xs = let (l, r) = split xs in SplitF l r
 
+data BinTreeF : Type -> Type -> Type where
+  TipF : BinTreeF _ _
+  BranchF : a -> b -> b -> BinTreeF a b
+
+implementation Functor (BinTreeF a) where
+  map f TipF = TipF
+  map f (BranchF x y z) = BranchF x (f y) (f z)
+
+binTreeProd : Algebra (BinTreeF Nat) Nat
+binTreeProd TipF = 1
+binTreeProd (BranchF x y z) = x * y * z
+
 partial
-main : IO ()
-main = printLn $ fac 10
+pac' : Nat -> Nat
+pac' n = hylo binTreeProd coalg 1
+  where
+    coalg : Coalgebra (BinTreeF Nat) Nat
+    coalg Z = TipF
+    coalg x with (compare (x * 2) n)
+      | EQ = BranchF x (x * 2) 0
+      | LT = BranchF x (x * 2) (x * 2 + 1)
+      | GT = BranchF x 0 0
+
+partial
+pow'' : Nat -> Nat -> Nat
+pow'' x = hylo binTreeProd coalg
+  where
+    coalg : Coalgebra (BinTreeF Nat) Nat
+    coalg Z = TipF
+    coalg (S Z) = BranchF x 0 0
+    coalg n = let half = divNatNZ n 2 SIsNotZ in
+                  BranchF x half (minus n half)
+
+partition : List a -> (a -> Bool) -> (List a, List a)
+partition xs f = cata alg xs where
+  alg Neither = ([], [])
+  alg (Both x (l, r)) = if f x
+                           then (x::l, r)
+                           else (l, x::r)
+
+partial
+quickSort : Ord a => List a -> List a
+quickSort = hylo alg coalg
+  where
+    alg : Algebra (BinTreeF a) (List a)
+    alg TipF = []
+    alg (BranchF x l r) = l ++ (x::r)
+
+    coalg : Ord a => Coalgebra (BinTreeF a) (List a)
+    coalg [] = TipF
+    coalg (x::xs) = let (l, r) = partition xs (< x) in
+                        BranchF x l r
+
+codata CoBinTree : Type -> Type where
+  Tip : CoBinTree a 
+  Branch : a -> CoBinTree a -> CoBinTree a -> CoBinTree a
+
+implementation Corecursive (CoBinTree a) (BinTreeF a) where
+  ana coalg t with (coalg t)
+    | TipF = Tip
+    | (BranchF x l r) = Branch x (ana coalg l) (ana coalg r)
+
+combine : Ord a => CoBinTree a -> CoBinTree a -> CoBinTree a
+combine t Tip = t
+combine Tip t = t
+combine t@(Branch x l r) t'@(Branch y l' r')
+  = if x < y
+       then Branch x l (combine r t')
+       else Branch y (combine t l') r
+
+heapToList : Ord a => CoBinTree a -> CoList a
+heapToList = ana coalg where
+  coalg Tip = Neither
+  coalg (Branch x l r) = Both x (combine l r)
+
+decompose : Ord a => List a -> Maybe (a, List a, List a)
+decompose l = do (x, xs) <- bubble l
+                 let (l, r) = partition xs (< x)
+                 pure (x, l, r)
+
+listToHeap : Ord a => List a -> CoBinTree a
+listToHeap = ana coalg
+  where
+    coalg : Coalgebra (BinTreeF a) (List a)
+    coalg xs with (decompose xs)
+      | Nothing = TipF
+      | Just (x, l, r) = BranchF x l r
+
+heapSort : Ord a => List a -> CoList a
+heapSort = heapToList . listToHeap
