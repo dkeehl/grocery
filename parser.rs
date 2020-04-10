@@ -1,244 +1,252 @@
-use std::marker::PhantomData;
+#![allow(unused)]
+
 use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
-use std::cell::RefCell;
-use std::hash::Hash;
+use std::cell::{Cell, RefCell};
+use std::pin::Pin;
+use std::marker::PhantomPinned;
+use std::ptr::NonNull;
 
-trait Cont<T> {
-    fn run(&self, t: T);
+type Res<T> = Option<T>;
+
+trait Cont {
+    fn call(&self, res: Res<&'static str>);
 }
 
-impl<T, F> Cont<T> for F where F: Fn(T) {
-    fn run(&self, t: T) {
-        (self)(t)
-    }
-}
-
-trait ParseResult {
-    type Val;
-    fn apply(&self, k: Rc<dyn Cont<Self::Val>>);
-}
-
-impl<T, R> ParseResult for Rc<R> where
-    R: ParseResult<Val=T>
+impl<T> Cont for T
+where
+    T: Fn(Res<&'static str>)
 {
-    type Val = T;
-
-    fn apply(&self, k: Rc<dyn Cont<T>>) {
-        <R>::apply(&*self, k)
+    fn call(&self, res: Res<&'static str>) {
+        self(res)
     }
 }
 
-trait ParseResultAdapter: Sized {
-    fn map<F>(self, map_f: F) -> Map<Self, F> {
-        Map {
-            res: self,
-            map_f
-        }
-    }
-
-    fn flat_map<F>(self, map_f: F) -> FlatMap<Self, F> {
-        FlatMap {
-            res: self,
-            map_f
-        }
-    }
-
-    fn or_else<F, U>(self, alt: F) -> OrElse<Self, F, U> where
-        F: Fn() -> U
-    {
-        OrElse {
-            res: self,
-            alt,
-            u: RefCell::new(None),
-        }
-    }
+trait Parser {
+    fn parse(&self, input: &'static str, cont: Rc<dyn Cont>);
 }
 
-impl<T: ParseResult + Sized> ParseResultAdapter for T {}
-
-struct Success<T> {
-    t: T
-}
-
-impl<T: Clone> Success<T> {
-    fn new(t: T) -> Self {
-        Success { t }
-    }
-}
-
-impl<T: Clone> ParseResult for Success<T> {
-    type Val = T;
-    fn apply(&self, k: Rc<dyn Cont<T>>) {
-        k.run(self.t.clone())
-    }
-}
-
-struct Failure<T> {
-    _marker: PhantomData<T>
-}
-
-impl<T> Failure<T> {
-    fn new() -> Self {
-        Failure {
-            _marker: PhantomData
-        }
-    }
-}
-
-impl<T> ParseResult for Failure<T> {
-    type Val = T;
-    fn apply(&self, _: Rc<dyn Cont<T>>) {}
-}
-
-fn success<T: Clone + 'static>(t: T) -> Rc<dyn ParseResult<Val=T>> {
-    Rc::new(Success { t })
-}
-
-fn failure<T: 'static>() -> Rc<dyn ParseResult<Val=T>> {
-    Rc::new(Failure::new())
-}
-
-struct Map<T, F> {
-    res: T,
-    map_f: F
-}
-
-impl<R, T, U, F> ParseResult for Map<R, Rc<F>> where
-    U: 'static,
-    R: ParseResult<Val=T>,
-    F: 'static + ?Sized + Fn(T) -> U
+impl<F> Parser for F
+where
+    F: Fn(&'static str, Rc<dyn Cont>)
 {
-    type Val = U;
-
-    fn apply(&self, k: Rc<dyn Cont<U>>) {
-        let map_f = self.map_f.clone();
-        let k = move |t| k.run((map_f)(t));
-        self.res.apply(Rc::new(k))
+    fn parse(&self, input: &'static str, cont: Rc<dyn Cont>) {
+        self(input, cont)
     }
 }
 
-struct FlatMap<T, F> {
-    res: T,
-    map_f: F,
-}
-
-impl<R, T, U, S, F> ParseResult for FlatMap<R, Rc<F>> where
-    R: ParseResult<Val=T>,
-    F: 'static + ?Sized + Fn(T) -> U,
-    U: ParseResult<Val=S>,
-    S: 'static
-{
-    type Val = S;
-
-    fn apply(&self, k: Rc<dyn Cont<S>>) {
-        let map_f = self.map_f.clone();
-        let k_ = k.clone();
-        let k = move |t| (map_f)(t).apply(k_.clone());
-        self.res.apply(Rc::new(k))
+impl<T: Parser> Parser for Rc<T> {
+    fn parse(&self, input: &'static str, cont: Rc<dyn Cont>) {
+        <T>::parse(&**self, input, cont)
     }
 }
 
-struct OrElse<T, F, U> {
-    res: T,
-    alt: F,
-    u: RefCell<Option<U>>
+#[derive(Clone, Copy)]
+struct Terminal {
+    t: &'static str
 }
 
-impl<R, T, U, F> ParseResult for OrElse<R, F, U> where
-    R: ParseResult<Val=T>,
-    F: Fn() -> U,
-    U: ParseResult<Val=T>
-{
-    type Val = T;
-
-    fn apply(&self, k: Rc<dyn Cont<T>>) {
-        let first_run = self.u.borrow().is_none();
-        if first_run {
-            let u = (self.alt)();
-            let _ = self.u.borrow_mut().replace(u);
-        }
-        self.res.apply(k.clone());
-        self.u.borrow().as_ref().unwrap().apply(k);
-    }
-}
-
-type Ret = usize;
-
-trait Recognizer {
-    fn recognize(&self, input: &str, i: usize)
-        -> Rc<dyn ParseResult<Val=Ret>>;
-}
-
-struct MemoizedResult<T, R> {
-    rs: Rc<RefCell<HashSet<T>>>,
-    ks: Rc<RefCell<Vec<Rc<dyn Cont<T>>>>>,
-    res: R
-}
-
-impl<T, R> ParseResult for MemoizedResult<T, Rc<R>> where
-    R: ParseResult<Val=T> + ?Sized,
-    T: Clone + Hash + Eq + 'static
-{
-    type Val=T;
-
-    fn apply(&self, k: Rc<dyn Cont<T>>) {
-        let first_call = self.ks.borrow().is_empty();
-        if first_call {
-            self.ks.borrow_mut().push(k);
-            let rs = Rc::downgrade(&self.rs);
-            let ks = Rc::downgrade(&self.ks);
-            let k_i = move |t| {
-                let rs = rs.upgrade().unwrap();
-                let ks = ks.upgrade().unwrap();
-                let called_here = rs.borrow().contains(&t);
-                if !called_here {
-                    rs.borrow_mut().insert(t.clone());
-                    for k in ks.borrow().iter() {
-                        k.run(t.clone());
-                    }
-                }
-            };
-            //  Maybe res should init at this time?
-            self.res.apply(Rc::new(k_i));
+impl Parser for Terminal {
+    fn parse(&self, input: &'static str, cont: Rc<dyn Cont>) {
+        if input.starts_with(self.t) {
+            let ret = &input[self.t.len()..];
+            cont.call(Some(ret))
         } else {
-            self.ks.borrow_mut().push(k.clone());
-            for t in self.rs.borrow().iter() {
-                k.run(t.clone());
+            cont.call(None)
+        }
+    }
+}
+
+fn terminal(t: &'static str) -> Terminal {
+    Terminal { t }
+}
+
+fn epsilon(input: &'static str, cont: Rc<dyn Cont>) {
+    cont.call(Some(input))
+}
+
+fn seq<A, B>(a: A, b: B) -> impl Fn(&'static str, Rc<dyn Cont>)
+where
+    A: Parser,
+    B: Parser + Clone + 'static,
+{
+    // TODO cache results
+    move |input, cont| {
+        let b = b.clone();
+        let cont = cont.clone();
+        let k = move |res| {
+            if let Some(next) = res {
+                b.parse(next, cont.clone())
+            } else {
+                cont.call(None)
             }
-        }
+        };
+        a.parse(input, Rc::new(k))
     }
 }
 
-impl<T> MemoizedResult<T, Rc<dyn ParseResult<Val=T>>> where
-    T: Clone + Hash + Eq + 'static
+fn alt<A, B>(a: A, b: B) -> impl Fn(&'static str, Rc<dyn Cont>)
+where
+    A: Parser,
+    B: Parser,
 {
-    fn new(res: Rc<dyn ParseResult<Val=T>>) -> Self {
+    move |input, cont| {
+        a.parse(input, cont.clone());
+        b.parse(input, cont);
+    }
+}
+
+type Table<T> = RefCell<HashMap<&'static str, T>>;
+
+type RcMut<T> = Rc<RefCell<T>>;
+
+struct Fix {
+    cache: Table<(RcMut<HashSet<Res<&'static str>>>, RcMut<Vec<Rc<dyn Cont>>>)>,
+    parser: RefCell<Option<Rc<dyn Parser>>>,
+    builder: Box<dyn Fn(&'static Fix) -> Rc<dyn Parser>>,
+    // pointing to self
+    ptr: Cell<NonNull<Fix>>,
+    _marker: PhantomPinned,
+}
+
+impl Parser for Fix {
+    fn parse(&self, input: &'static str, cont: Rc<dyn Cont>) {
+        if let Some((rs, ks)) = self.cache.borrow().get(&input) {
+            // Self has been called at this position before
+            ks.borrow_mut().push(cont.clone());
+            for &res in rs.borrow().iter() {
+                cont.call(res)
+            }
+            return;
+        } 
+        // First called at this position
+
+        // create cache entry
         let rs = Rc::new(RefCell::new(HashSet::new()));
-        let ks = Rc::new(RefCell::new(vec![]));
-        MemoizedResult { rs, ks, res }
+        let ks = Rc::new(RefCell::new(vec![cont.clone()])); // Just store the contiuation.
+
+        // make a new contiuation for all sub branches.
+        let rs_ = Rc::downgrade(&rs);
+        let ks_ = Rc::downgrade(&ks);
+        let k_i = move |res| {
+            let rs = rs_.upgrade().unwrap();
+            let new_result = !rs.borrow().contains(&res);
+            if new_result {
+                rs.borrow_mut().insert(res);
+                let ks = ks_.upgrade().unwrap();
+                for cont in ks.borrow().iter() {
+                    cont.call(res);
+                }
+            }
+        };
+
+        self.cache.borrow_mut().insert(input, (rs, ks));
+        let parser = self._build();
+        parser.parse(input, Rc::new(k_i))
     }
 }
 
-struct MemoizedRecognizer<T> {
-    cache: RefCell<HashMap<usize, Rc<dyn ParseResult<Val=Ret>>>>,
-    rec: T
+impl Parser for &Fix {
+    fn parse(&self, input: &'static str, cont: Rc<dyn Cont>) {
+        <Fix>::parse(*self, input, cont)
+    }
 }
 
-impl<T> Recognizer for MemoizedRecognizer<T> where
-    T: Recognizer
-{
-    fn recognize(&self, input: &str, i: usize)
-        -> Rc<dyn ParseResult<Val=Ret>>
-    {
-        let t = self.cache.borrow();
-        if let Some(res) = t.get(&i) {
-            return res.clone();
+impl Fix {
+    fn _build(&self) -> Rc<dyn Parser> {
+        let key = self as *const Fix;
+        if let Some(parser) = self.parser.borrow().as_ref() {
+            // use cached
+            let ptr = self.ptr.get().as_ptr() as *const Fix;
+            assert_eq!(ptr, key);
+            return parser.clone();
         }
-        let res = self.rec.recognize(input, i);
-        let res = MemoizedResult::new(res);
-        let res: Rc<dyn ParseResult<Val=Ret>> = Rc::new(res);
-        self.cache.borrow_mut().insert(i, Rc::clone(&res));
-        res
+        // called first time
+        let fix = unsafe { key.as_ref().unwrap() }; // cast lifetime to 'static
+        let parser = (*self.builder)(fix);
+        let _ = self.parser.borrow_mut().replace(parser.clone());
+        self.ptr.set(self.into());
+        parser
+    }
+
+    fn new<P, F>(f: F) -> Pin<Box<Fix>>
+    where
+        P: Parser + 'static,
+        F: 'static + Fn(&'static Fix) -> P
+    {
+        let cache = RefCell::new(HashMap::new());
+        let ptr = Cell::new(NonNull::dangling());
+        let parser = RefCell::new(None);
+        let builder = move |fix| -> Rc<dyn Parser> {
+            Rc::new(f(fix))
+        };
+        let builder = Box::new(builder);
+        let fix = Fix {
+            cache,
+            ptr,
+            parser,
+            builder,
+            _marker: PhantomPinned,
+        };
+        Box::pin(fix)
+    }
+}
+
+macro_rules! fix {
+    ($name:ident := $body:expr) => {
+        Fix::new(move |$name: &'static Fix| $body)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{*, Parser, Cont};
+
+    macro_rules! k {
+        () => {{
+            let k = |res| {
+                println!("{:?}", res);
+            };
+            Rc::new(k)
+        }}
+    }
+
+    fn expect(res: Option<&str>) {
+        println!("expect {:?}", res);
+    }
+
+    #[test]
+    fn parser_test() {
+        let cont = k!();
+        let ab = terminal("ab");
+        expect(Some("c"));
+        ab.parse("abc", cont.clone());
+
+        let rule = seq(ab, terminal("/"));
+        expect(Some("c"));
+        rule.parse("ab/c", cont.clone());
+
+        expect(None);
+        rule.parse("abc", cont.clone());
+
+        let rule = alt(rule, terminal("ab"));
+        expect(Some(""));
+        rule.parse("ab", cont);
+    }
+
+    #[test]
+    fn fix_test() {
+        let cont = k!();
+        let rule = fix!(s := alt(terminal("a"), seq(terminal("b"), s)));
+        expect(Some(""));
+        rule.parse("ba", cont);
+    }
+
+    #[test]
+    fn left_recursive() {
+        let cont = k!();
+        let a = terminal("a");
+        let rule = fix!(s := alt(seq(s, a), a));
+        rule.parse("aaa", cont);
     }
 }
